@@ -1,0 +1,7 @@
+1. Koppla: https://huggingface.co/spaces/Kazami07/medical-assistant-llm/tree/main
+till projectet
+2. Låta denna ai först behadla input till något som är mer läsbart för icd11 API
+3. kör API call
+4. Kritik LLM, en annan?
+5. Returnera eller markera som ej tydlig nog.
+
