@@ -43,9 +43,8 @@ LANGUAGE = "en"
 class ICDCandidate:
     code: Optional[str]
     title: str
-    entity_id: Optional[str]
-    source_url: Optional[str]
-    score: float
+    definition: str
+    foundation_uri: Optional[str]
 
 
 class ICDAPIError(RuntimeError):
@@ -217,6 +216,7 @@ def candidate_code(raw_item: Dict[str, Any]) -> Optional[str]:
 
 
 def candidate_entity_id(raw_item: Dict[str, Any]) -> Optional[str]:
+    """Extract the entity URL/ID for later fetching full details."""
     for key in ("id", "@id", "destinationEntity", "source"):
         val = raw_item.get(key)
         if isinstance(val, str) and val.strip():
@@ -224,7 +224,25 @@ def candidate_entity_id(raw_item: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def get_entity_definition(client: ICD11Client, entity_url: str) -> str:
+    """Fetch the full entity definition from WHO API."""
+    try:
+        entity_data = client.get_entity(entity_url)
+        # Look for definition in common keys
+        for key in ("definition", "descriptions", "classKind"):
+            val = entity_data.get(key)
+            if isinstance(val, str):
+                return val
+            if isinstance(val, dict) and "@value" in val:
+                return val["@value"]
+        # Fallback to title if no explicit definition
+        return entity_data.get("title", "")
+    except Exception:
+        return ""
+
+
 def lexical_score(query: str, title: str) -> float:
+    """Calculate similarity score between query and title."""
     if not title:
         return 0.0
 
@@ -242,9 +260,12 @@ def lexical_score(query: str, title: str) -> float:
 def rerank_candidates(
     query: str,
     raw_results: List[Dict[str, Any]],
+    client: Optional[ICD11Client] = None,
     threshold: float = 0.35,
 ) -> List[ICDCandidate]:
+    """Rerank API results by relevance; optionally fetch full entity definitions."""
     out: List[ICDCandidate] = []
+    scores: Dict[int, float] = {}  # Track scores for sorting
 
     for item in raw_results:
         title = candidate_title(item)
@@ -260,17 +281,22 @@ def rerank_candidates(
             score += 0.10
 
         if score >= threshold:
-            out.append(
-                ICDCandidate(
-                    code=code,
-                    title=title,
-                    entity_id=entity_id,
-                    source_url=entity_id,
-                    score=round(min(score, 1.0), 4),
-                )
-            )
+            # Fetch definition if client provided
+            definition = ""
+            if client and entity_id:
+                definition = get_entity_definition(client, entity_id)
 
-    out.sort(key=lambda x: x.score, reverse=True)
+            candidate = ICDCandidate(
+                code=code,
+                title=title,
+                definition=definition,
+                foundation_uri=entity_id,
+            )
+            out.append(candidate)
+            scores[len(out) - 1] = round(min(score, 1.0), 4)
+
+    # Sort by score
+    out.sort(key=lambda x: scores[out.index(x)], reverse=True)
     return out
 
 
@@ -288,28 +314,29 @@ def pick_items_from_search_response(search_json: Dict[str, Any]) -> List[Dict[st
 def map_diagnosis_to_icd11(
     diagnosis: str,
     client: ICD11Client,
-    top_k: int = 5,
+    top_k: int = 3,
     threshold: float = 0.35,
 ) -> Dict[str, Any]:
+    """Map a diagnosis string to ICD-11 candidates.
+    
+    Returns a dict matching the SearchResults schema:
+    {
+        "candidates": [{"code", "title", "definition", "foundation_uri"}, ...]
+    }
+    """
     original = diagnosis
     normalized = normalize_text(diagnosis)
 
     # Guardrail: if the note is likely negated, flag it instead of coding it directly.
     is_negated = extract_negation(normalized)
-
     if is_negated:
-        return {
-            "input": original,
-            "normalized": normalized,
-            "negation_flag": True,
-            "candidates": [],
-            "note": "Possible negation detected; needs human review before coding.",
-        }
+        # Return empty candidates for negated diagnoses
+        return {"candidates": []}
 
     # First pass: direct search
     search_json = client.search(normalized, limit=15, use_flexisearch=True)
     raw_items = pick_items_from_search_response(search_json)
-    candidates = rerank_candidates(normalized, raw_items, threshold=threshold)
+    candidates = rerank_candidates(normalized, raw_items, client=client, threshold=threshold)
 
     # Fallback: if too few hits, try a simplified query
     if len(candidates) < 2:
@@ -318,7 +345,7 @@ def map_diagnosis_to_icd11(
         if simplified and simplified != normalized:
             search_json_2 = client.search(simplified, limit=15, use_flexisearch=True)
             raw_items_2 = pick_items_from_search_response(search_json_2)
-            more = rerank_candidates(simplified, raw_items_2, threshold=threshold)
+            more = rerank_candidates(simplified, raw_items_2, client=client, threshold=threshold)
 
             # Deduplicate by code/title
             seen = {(c.code, c.title) for c in candidates}
@@ -328,12 +355,7 @@ def map_diagnosis_to_icd11(
                     candidates.append(c)
                     seen.add(key)
 
-            candidates.sort(key=lambda x: x.score, reverse=True)
-
     return {
-        "input": original,
-        "normalized": normalized,
-        "negation_flag": False,
         "candidates": [asdict(c) for c in candidates[:top_k]],
     }
 

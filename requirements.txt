@@ -1,0 +1,4 @@
+requests
+rapidfuzz
+python-dotenv
+ollama
